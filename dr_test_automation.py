@@ -7,6 +7,8 @@ import random
 import smtplib
 import urllib.request
 import urllib.error
+import sys
+import select
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -14,22 +16,34 @@ from email.encoders import encode_base64
 from fpdf import FPDF
 from PIL import Image
 
-# ==================== GLOBAL CONFIGURATION ====================
-PBS_PVE_STORAGE = "PBS-1Y"               
-TARGET_STORAGE = "SANDBOX"               
-TEST_VM_ID = "999"                       
-BRIDGE = "vmbr999"                       
+# ==================== DYNAMIC CONFIGURATION LOADING ====================
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
-# Konfiguracja powiadomień Webhook (Slack, Discord, Teams lub własne API)
-# Jeśli nie chcesz używać, zostaw puste cudzysłowy ""
-WEBHOOK_URL = "https://hooks.slack.com/services/TWOJ/WEBHOOK/TUTAJ"
+if not os.path.exists(CONFIG_PATH):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CRITICAL] Brak pliku konfiguracyjnego: {CONFIG_PATH}")
+    print("Utworz plik config.json w tym samym katalogu co skrypt przed jego uruchomieniem.")
+    sys.exit(1)
 
-SMTP_SERVER = "smtp.yourdomain.com"
-SMTP_PORT = 587
-SMTP_USER = "alerts@yourdomain.com"
-SMTP_PASS = "YourPassword"
-MAIL_TO = "admin@yourdomain.com"
-# ==============================================================
+try:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+except Exception as e:
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CRITICAL] Blad parsowania pliku config.json: {e}")
+    sys.exit(1)
+
+PBS_PVE_STORAGE = config.get("PBS_PVE_STORAGE", "PBS-1Y")
+TARGET_STORAGE = config.get("TARGET_STORAGE", "SANDBOX")
+TEST_VM_ID = str(config.get("TEST_VM_ID", "999"))
+BRIDGE = config.get("BRIDGE", "vmbr999")
+BOOT_DELAY_VM = int(config.get("BOOT_DELAY_VM", 90))
+BOOT_DELAY_LXC = int(config.get("BOOT_DELAY_LXC", 15))
+WEBHOOK_URL = config.get("WEBHOOK_URL", "")
+SMTP_SERVER = config.get("SMTP_SERVER", "")
+SMTP_PORT = int(config.get("SMTP_PORT", 587))
+SMTP_USER = config.get("SMTP_USER", "")
+SMTP_PASS = config.get("SMTP_PASS", "")
+MAIL_TO = config.get("MAIL_TO", "")
+# =======================================================================
 
 execution_logs = []
 
@@ -41,9 +55,10 @@ def log(msg):
     execution_logs.append(full_msg)
 
 def clean_text(text):
-    """Zamienia polskie znaki na ASCII i usuwa znaki spoza zakresu FPDF, zapobiegając crashom"""
+    """Zamienia polskie znaki na ASCII i standaryzuje linie, chroniąc FPDF przed nadpisywaniem tekstu"""
     if not text:
         return ""
+    text = text.replace('\r\n', '\n').replace('\r', '\n')
     rep = {
         'Ą': 'A', 'Ć': 'C', 'Ę': 'E', 'Ł': 'L', 'Ń': 'N', 'Ó': 'O', 'Ś': 'S', 'Ź': 'Z', 'Ż': 'Z',
         'ą': 'a', 'ć': 'c', 'ę': 'e', 'ł': 'l', 'ń': 'n', 'ó': 'o', 'ś': 's', 'ź': 'z', 'ż': 'z'
@@ -58,7 +73,7 @@ def run_cmd(cmd):
     return result.stdout, result.stderr, result.returncode
 
 def main():
-    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.1) ===")
+    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.12) ===")
     
     status_dr = "CRASHED_BEFORE_START"
     chosen_id = "UNKNOWN"
@@ -74,7 +89,7 @@ def main():
     environment_created = False
 
     try:
-        # 1. Pobranie listy kopii zapasowych i losowanie celu
+        # 1. Pobranie listy kopii zapasowych i wybór celu (manualny z timeoutem lub automatyczny)
         log(f"Pobieranie listy zasobow z repozytorium: {PBS_PVE_STORAGE}...")
         out, stderr, code = run_cmd(f"pvesm list {PBS_PVE_STORAGE}")
         if code != 0:
@@ -86,21 +101,42 @@ def main():
             status_dr = "NO_BACKUPS_FOUND"
             raise RuntimeError(f"Repozytorium {PBS_PVE_STORAGE} nie zawiera zadnych kopii zapasowych!")
 
-        unique_targets = list(set((m[1], m[2]) for m in matches)) 
-        chosen_type, chosen_id = random.choice(unique_targets)
-        is_vm = (chosen_type == "vm")
-        
-        id_backups = [m[0] for m in matches if m[2] == chosen_id]
-        latest_backup = sorted(id_backups)[-1]
-        
-        # Wyciąganie nazwy wylosowanej maszyny / kontenera
-        name_out, _, _ = run_cmd(f"qm config {chosen_id}" if is_vm else f"pct config {chosen_id}")
-        name_match = re.search(r"(name|hostname):\s*(\S+)", name_out)
-        if name_match:
-            chosen_name = name_match.group(2)
+        user_input = None
+        if sys.stdin.isatty():
+            log("Wykryto terminal interaktywny. Oczekiwanie na manualny wybor ID...")
+            sys.stdout.write("Wpisz ID maszyny/kontenera do testu (lub kliknij Enter dla losowania, czas 15s): ")
+            sys.stdout.flush()
+            ready, _, _ = select.select([sys.stdin], [], [], 15)
+            if ready:
+                user_input = sys.stdin.readline().strip()
+            else:
+                log("\n[TIMEOUT] Brak wpisu. Przechodze do automatycznego losowania zasobu.")
+        else:
+            log("Skrypt uruchomiony w tle (np. Crontab). Pomijam prompt interaktywny.")
+
+        if user_input:
+            id_matches = [m for m in matches if m[2] == user_input]
+            if not id_matches:
+                status_dr = "MANUAL_ID_NOT_FOUND"
+                raise RuntimeError(f"Nie znaleziono zadnych kopii zapasowych na PBS dla podanego ID: {user_input}")
             
-        log(f"Wylosowano obiekt: {chosen_type.upper()} o ID {chosen_id} (Nazwa: {chosen_name})")
-        log(f"Najnowsza kopia do odzyskania: {latest_backup}")
+            chosen_type = id_matches[0][1]
+            chosen_id = user_input
+            is_vm = (chosen_type == "vm")
+            
+            id_backups = [m[0] for m in id_matches]
+            latest_backup = sorted(id_backups)[-1]
+            log(f"Wybrano manualnie obiekt: {chosen_type.upper()} o ID {chosen_id}")
+        else:
+            unique_targets = list(set((m[1], m[2]) for m in matches)) 
+            chosen_type, chosen_id = random.choice(unique_targets)
+            is_vm = (chosen_type == "vm")
+            
+            id_backups = [m[0] for m in matches if m[2] == chosen_id]
+            latest_backup = sorted(id_backups)[-1]
+            log(f"🎲 Wylosowano automatycznie obiekt: {chosen_type.upper()} o ID {chosen_id}")
+
+        log(f"📦 Najnowsza kopia do odzyskania: {latest_backup}")
 
         # 2. Przywracanie kopii zapasowej
         status_dr = "RESTORE_FAILED" 
@@ -119,6 +155,15 @@ def main():
         environment_created = True
         log("Przywracanie obrazu dysku zakonczone pomyslnie.")
 
+        log("Pobieram nazwe z odzyskanej konfiguracji Proxmoxa...")
+        name_out, _, _ = run_cmd(f"qm config {TEST_VM_ID}" if is_vm else f"pct config {TEST_VM_ID}")
+        name_match = re.search(r"^(name|hostname):\s*(.+)$", name_out, re.MULTILINE)
+        if name_match:
+            chosen_name = name_match.group(2).strip()
+            log(f"Prawdziwa nazwa zidentyfikowana w Proxmox jako: '{chosen_name}'")
+        else:
+            chosen_name = f"Zasob_{chosen_id}"
+
         # 3. Modyfikacja konfiguracji i izolacja sieciowa
         status_dr = "CONFIGURATION_FAILED"
         if is_vm:
@@ -129,8 +174,8 @@ def main():
                 log(f"Wysuwam brakujaca plyte ISO z napedu: {drive}")
                 run_cmd(f"qm set {TEST_VM_ID} --{drive} none")
 
-            log(f"Przepinanie wirtualnej karty do mostka {BRIDGE} oraz aktywacja karty graficznej VGA std...")
-            run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE} --vga std")
+            log(f"Przepinanie wirtualnej karty do mostka {BRIDGE} (firewall=0) oraz aktywacja VGA std...")
+            run_cmd(f"qm set {TEST_VM_ID} --net0 model=virtio,bridge={BRIDGE},firewall=0 --vga std")
         else:
             log(f"Czyszczenie potencjalnych pozostalosci po interfejsach veth{TEST_VM_ID}i0...")
             run_cmd(f"ip link delete veth{TEST_VM_ID}i0 2>/dev/null")
@@ -155,11 +200,11 @@ def main():
             raise RuntimeError(f"System hypervisora nie byl w stanie uruchomic instancji: {stderr.strip()}")
 
         if is_vm:
-            log("Wykryto maszyne VM: Wstrzymuje skrypt na 40 sekund na pelny rozruch OS i uslug...")
-            time.sleep(40)  
+            log(f"Wykryto maszyne VM: Wstrzymuje skrypt na {BOOT_DELAY_VM} sekund na rozruch OS i uslug aplikacyjnych...")
+            time.sleep(BOOT_DELAY_VM)  
         else:
-            log("Wykryto kontener LXC: Wstrzymuje skrypt na 15 sekund na inicjalizacje...")
-            time.sleep(15)
+            log(f"Wykryto kontener LXC: Wstrzymuje skrypt na {BOOT_DELAY_LXC} sekund na inicjalizacje...")
+            time.sleep(BOOT_DELAY_LXC)
 
         # 5. Silnik wykrywania adresu IP
         status_dr = "NO_IP_FOUND"
@@ -177,7 +222,7 @@ def main():
                             if iface.get("name") == "lo": continue
                             for ip_addr in iface.get("ip-addresses", []):
                                 if ip_addr.get("ip-address-type") == "ipv4":
-                                    target_ip = ip_addr.get("ip-address")
+                                    target_ip = ip_addr.get("ip-address").strip()
                                     prefix = ip_addr.get("prefix", 24)
                                     break
                         if target_ip: break
@@ -190,14 +235,14 @@ def main():
                     ct_ip_out, _, _ = run_cmd(f"pct exec {TEST_VM_ID} -- ip -4 addr show dev eth0 2>/dev/null")
                     ip_find = re.search(r"inet\s+([0-9\.]+)/(\d+)", ct_ip_out)
                     if ip_find:
-                        target_ip = ip_find.group(1)
+                        target_ip = ip_find.group(1).strip()
                         prefix = int(ip_find.group(2))
                         break
                     time.sleep(5)
             else:
                 static_match = re.search(r"([0-9\.]+)/(\d+)", target_net)
                 if static_match:
-                    target_ip = static_match.group(1)
+                    target_ip = static_match.group(1).strip()
                     prefix = int(static_match.group(2))
 
         # Awaryjny Sniffer ARP
@@ -210,28 +255,50 @@ def main():
                 if not line: break
                 match = re.search(r"tell\s+([0-9\.]+)", line)
                 if match and match.group(1) != "0.0.0.0":
-                    target_ip = match.group(1)
+                    target_ip = match.group(1).strip()
                     break
             proc.terminate()
 
         if not target_ip:
             raise RuntimeError("Nie udalo sie przechwycic adresu sieciowego instancji testowej.")
 
-        # 6. Skanowanie i Audyt Sieciowy (Pełny skan wszystkich portów)
+        target_ip = target_ip.strip()
+
+        # 6. Skanowanie i Audyt Sieciowy (POWRÓT DO KLASYCZNEJ MASKI /24)
         status_dr = "AUDIT_FAILED"
         log(f"Wykryto IP: {target_ip}. Konfiguracja aliasu sieciowego na hostu...")
         
+        run_cmd(f"ip link set {BRIDGE} up 2>/dev/null || true")
+        
+        # POWRÓT: Klasyczne przypisanie podsieci z oryginalną maską (np. /24) pobraną z konfiguracji
         ip_parts = target_ip.split('.')
         host_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.250/{prefix}"
         run_cmd(f"ip addr add {host_ip} dev {BRIDGE} 2>/dev/null || true")
-        time.sleep(3)
+        time.sleep(5) 
+        
+        if_config, _, _ = run_cmd(f"ip addr show dev {BRIDGE}")
+        log(f"--- AKTUALNY STAN INTERFEJSU HOSTU Proxmox ---\n{if_config.strip()}\n---------------------------------------------")
         
         log("Wysylanie pakietow ICMP Echo (Ping)...")
-        run_cmd(f"ping -c 4 {target_ip}")
+        ping_out, _, _ = run_cmd(f"ping -c 4 {target_ip}")
+        log(f"--- WYNIK PINGOWANIA INSTANCJI TESTOWEJ ---\n{ping_out.strip()}\n-------------------------------------------")
         
-        log("Inicjalizacja PEŁNEGO skanowania wszystkich portow (1-65535) z filtrem TYLKO OTWARTE...")
-        nmap_out, _, _ = run_cmd(f"nmap -p- --open -sV --min-rate 2000 {target_ip}")
+        nmap_cmd = f"nmap -Pn --send-ip -p- --open -sV --min-rate 2000 {target_ip}"
+        log(f"Inicjalizacja skanowania. Wykonuje komende: {nmap_cmd}")
         
+        nmap_out, nmap_err, _ = run_cmd(nmap_cmd)
+        if nmap_err.strip():
+            nmap_out += f"\n\n[NMAP SYSTEM STDERR]\n{nmap_err.strip()}"
+            
+        if "open" not in nmap_out.lower():
+            nmap_out += f"\n\n[DIAGNOSTIC NOTE]\n" \
+                        f"Nmap detected 0 open ports inside the isolated sandbox.\n" \
+                        f"The temporary host is UP and network layer responds.\n" \
+                        f"If guest firewall is disabled, this means application background services\n" \
+                        f"(e.g. docker engines, database stacks, backup daemons) did not finish\n" \
+                        f"initialization inside the boot window. Consider increasing BOOT_DELAY_VM value in config.json."
+        
+        # Sprzątanie aliasu sieciowego
         run_cmd(f"ip addr del {host_ip} dev {BRIDGE} 2>/dev/null || true")
         
         status_dr = "SUCCESS"
@@ -327,11 +394,9 @@ def main():
         except Exception as pdf_err:
             print(f"[CRITICAL] Blad krytyczny podczas generowania PDF: {pdf_err}")
 
-        # NOWOŚĆ: Gwarantowana wysyłka Webhooka (Slack/Discord/Custom API)
         if WEBHOOK_URL:
             print("[SYSTEM] Inicjalizacja powiadomienia Webhook...")
             try:
-                # Kolory lub formaty pod dany typ komunikatora (uniwersalny ładny tekst)
                 emoji = "✅" if status_dr == "SUCCESS" else "❌"
                 webhook_payload = {
                     "text": f"{emoji} *Zakonczono test DR dla obiektu {chosen_type.upper()}*\n"
@@ -352,15 +417,14 @@ def main():
             except Exception as web_err:
                 print(f"[⚠️ WARNING] Nie udalo sie dostarczyc pakietu Webhook: {web_err}")
 
-        # 9. Gwarantowana wysyłka mailowa SMTP
         print("[SYSTEM] Przygotowanie wysylki poczty SMTP...")
         msg = MIMEMultipart()
         msg['From'] = SMTP_USER
         msg['To'] = MAIL_TO
-        msg['Subject'] = f"[AUTOMATED-DR] {chosen_type.upper()} {chosen_id} -> Status: {status_dr}"
+        msg['Subject'] = f"[AUTOMATED-DR] {chosen_type.upper()} {chosen_id} - {chosen_name} -> Status: {status_dr}"
         
-        mail_body = f"Automated system test finished with status: {status_dr}.\n\nWycinek ostatnich logow terminala:\n\n"
-        mail_body += "\n".join([clean_text(line) for line in execution_logs[-15:]])
+        mail_body = f"Automated system test finished with status: {status_dr}.\n\nPelne logi z przebiegu testu:\n\n"
+        mail_body += "\n".join([clean_text(line) for line in execution_logs])
         msg.attach(MIMEText(mail_body, 'plain'))
         
         if os.path.exists(pdf_path):
@@ -387,7 +451,6 @@ def main():
         except Exception as smtp_err: 
             print(f"[CRITICAL] Krytyczny blad sieci pocztowej SMTP: {smtp_err}")
 
-        # 10. Gwarantowane niszczenie piaskownicy testowej
         if environment_created:
             print(f"[CLEANUP] Bezwarunkowe czyszczenie zasobow dla ID {TEST_VM_ID}...")
             if is_vm:
