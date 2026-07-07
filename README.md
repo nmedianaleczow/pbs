@@ -1,4 +1,4 @@
-# Proxmox VE Automated DR Test Engine (v4.1)
+# Proxmox VE Automated DR Test Engine (v4.12)
 
 Automated Disaster Recovery (DR) testing script for Proxmox VE clusters connected to Proxmox Backup Server (PBS).
 
@@ -123,3 +123,25 @@ Append the following line:
 ```
 0 2 * * 0 /usr/bin/python3 /root/dr_test_automation.py >> /var/log/dr_script_cron.log 2>&1
 ```
+## Changelog / Historia zmian
+
+### v4.12
+**🇵🇱 Wersja polska:**
+* **Zewnętrzny plik konfiguracyjny (`config.json`):** Odseparowano hasła SMTP, tokeny webhooków i nazwy zasobów od kodu źródłowego, co umożliwia bezpieczne aktualizacje samego skryptu.
+* **Manualny wybór ID z timeoutem:** Dodano opcję ręcznego wskazania ID maszyny do testu DR. Skrypt odczekuje 15 sekund na wpis użytkownika – w przypadku braku akcji automatycznie przechodzi do losowania.
+* **Dynamiczne pobieranie nazw maszyn:** Naprawiono błąd wyświetlania `UNKNOWN_NAME` — skrypt pobiera teraz prawdziwą nazwę bezpośrednio z odzyskanej konfiguracji Proxmoxa.
+* **Deaktywacja Zapory PVE (Firewall):** Wymuszono wyłączenie firewallu klastra Proxmox dla maszyn wirtualnych (`firewall=0`), co zapobiega domyślnemu blokowaniu ruchu wewnątrz odizolowanego mostka.
+* **Wymuszenie aktywacji interfejsu:** Dodano automatyczne podnoszenie wirtualnego mostka (`ip link set ... up`) przed rozpoczęciem audytu sieciowego.
+* **Usprawnienia skanowania Nmap:** Wprowadzono flagi `-Pn` (pomijanie sprawdzania ping) oraz `--send-ip` (wymuszenie trasowania warstwy 3), eliminując błędy tablicy ARP i błyskawiczne zamykanie procesu na świeżych interfejsach.
+* **Pełne logowanie w e-mailach:** Wiadomości SMTP zawierają teraz kompletny zrzut logów z konsoli zamiast ostatnich 15 linii.
+* **Zaawansowana diagnostyka w PDF:** Do raportu dodano logowanie wyniku komendy `ping` oraz automatyczną sekcję rozwiązywania problemów w przypadku wykrycia 0 otwartych portów.
+
+**🇬🇧 English Version:**
+* **Externalized Configuration (`config.json`):** Completely separated credentials (SMTP passwords, webhook tokens, storage names) from the source code, allowing safe script updates.
+* **Manual ID Input with Timeout:** Added capability to manually select a specific VM/CT for the DR test. The script waits 15 seconds for user input and automatically falls back to random selection if no input is detected.
+* **Robust Name Resolution:** Fixed the bug that previously caused VM names to display as `UNKNOWN_NAME`. The script now extracts the real hostname directly from the active temporary instance configuration.
+* **PVE Firewall Deactivation:** Explicitly disabled the Proxmox cluster firewall for Virtual Machines (`firewall=0`) to prevent default traffic dropping inside the isolated sandbox.
+* **Interface Activation Force:** Added automated virtual bridge interface activation (`ip link set ... up`) prior to starting network scans.
+* **Nmap Scan Optimizations:** Integrated `-Pn` (skip host discovery) and `--send-ip` (enforce Layer 3 routing) flags, resolving ARP table inconsistencies and instant scan drops on fresh virtual environments.
+* **Full Email Content Logs:** Updated the SMTP mail body to deliver the comprehensive terminal runtime output rather than filtering only the final 15 lines.
+* **Enhanced PDF Diagnostics:** Incorporated full `ping` output logging and an automated troubleshooting block (Diagnostic Note) that triggers if 0 open ports are discovered.
