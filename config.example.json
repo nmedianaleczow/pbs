@@ -1,0 +1,14 @@
+{
+  "PBS_PVE_STORAGE": "Twój-Storage",
+  "TARGET_STORAGE": "Twój-Sandbox",
+  "TEST_VM_ID": 999,
+  "BRIDGE": "vmbr999",
+  "BOOT_DELAY_VM": 90,
+  "BOOT_DELAY_LXC": 15,
+  "WEBHOOK_URL": "",
+  "SMTP_SERVER": "",
+  "SMTP_PORT": 587,
+  "SMTP_USER": "",
+  "SMTP_PASS": "",
+  "MAIL_TO": ""
+}
