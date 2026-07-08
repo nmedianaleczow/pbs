@@ -9,6 +9,7 @@ import urllib.request
 import urllib.error
 import sys
 import select
+import shutil
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
@@ -21,7 +22,6 @@ CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.j
 
 if not os.path.exists(CONFIG_PATH):
     print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] [CRITICAL] Brak pliku konfiguracyjnego: {CONFIG_PATH}")
-    print("Utworz plik config.json w tym samym katalogu co skrypt przed jego uruchomieniem.")
     sys.exit(1)
 
 try:
@@ -73,7 +73,7 @@ def run_cmd(cmd):
     return result.stdout, result.stderr, result.returncode
 
 def main():
-    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.12) ===")
+    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.26) ===")
     
     status_dr = "CRASHED_BEFORE_START"
     chosen_id = "UNKNOWN"
@@ -86,7 +86,9 @@ def main():
     target_ip = None
     is_vm = True
     png_path = "/tmp/dr_screen.png"
+    web_png_path = "/tmp/web_screen.png"
     environment_created = False
+    web_screenshot_taken = False
 
     try:
         # 1. Pobranie listy kopii zapasowych i wybór celu (manualny z timeoutem lub automatyczny)
@@ -264,13 +266,12 @@ def main():
 
         target_ip = target_ip.strip()
 
-        # 6. Skanowanie i Audyt Sieciowy (POWRÓT DO KLASYCZNEJ MASKI /24)
+        # 6. Skanowanie i Audyt Sieciowy
         status_dr = "AUDIT_FAILED"
         log(f"Wykryto IP: {target_ip}. Konfiguracja aliasu sieciowego na hostu...")
         
         run_cmd(f"ip link set {BRIDGE} up 2>/dev/null || true")
         
-        # POWRÓT: Klasyczne przypisanie podsieci z oryginalną maską (np. /24) pobraną z konfiguracji
         ip_parts = target_ip.split('.')
         host_ip = f"{ip_parts[0]}.{ip_parts[1]}.{ip_parts[2]}.250/{prefix}"
         run_cmd(f"ip addr add {host_ip} dev {BRIDGE} 2>/dev/null || true")
@@ -283,7 +284,7 @@ def main():
         ping_out, _, _ = run_cmd(f"ping -c 4 {target_ip}")
         log(f"--- WYNIK PINGOWANIA INSTANCJI TESTOWEJ ---\n{ping_out.strip()}\n-------------------------------------------")
         
-        nmap_cmd = f"nmap -Pn --send-ip -p- --open -sV --min-rate 2000 {target_ip}"
+        nmap_cmd = f"nmap -Pn --send-ip -p- --open -sV -sC --min-rate 2000 {target_ip}"
         log(f"Inicjalizacja skanowania. Wykonuje komende: {nmap_cmd}")
         
         nmap_out, nmap_err, _ = run_cmd(nmap_cmd)
@@ -297,14 +298,41 @@ def main():
                         f"If guest firewall is disabled, this means application background services\n" \
                         f"(e.g. docker engines, database stacks, backup daemons) did not finish\n" \
                         f"initialization inside the boot window. Consider increasing BOOT_DELAY_VM value in config.json."
-        
-        # Sprzątanie aliasu sieciowego
+        else:
+            # Silnik automatycznej analizy portów webowych z rozszerzoną tablicą monitorowania
+            web_ports = re.findall(r"(\d+)/tcp\s+open\s+(\S+)", nmap_out)
+            for port, service in web_ports:
+                service_lower = service.lower()
+                
+                # POPRAWKA KLUCZOWA: Rozszerzono listę portów o 8888 (Oxidized), 3000 (Grafana), 5000 (Flask), 9000 (Portainer)
+                if "http" in service_lower or port in ["80", "443", "8080", "8443", "8880", "8888", "3000", "5000", "9000"]:
+                    proto = "https" if (port in ["443", "8443"] or "ssl" in service_lower or "https" in service_lower) else "http"
+                    web_url = f"{proto}://{target_ip}:{port}"
+                    
+                    if shutil.which("chromium") or shutil.which("chromium-browser"):
+                        chrome_bin = "chromium" if shutil.which("chromium") else "chromium-browser"
+                        log(f"🌐 Wykryto aktywny port web {port}. Uruchamiam Chromium 147 (15s budżetu czasu) dla: {web_url}...")
+                        
+                        cmd_web = f"{chrome_bin} --headless --no-sandbox --disable-gpu --ignore-certificate-errors --virtual-time-budget=15000 --window-size=1920,1080 --screenshot={web_png_path} '{web_url}'"
+                        _, c_err, web_code = run_cmd(cmd_web)
+                        
+                        if os.path.exists(web_png_path) and os.path.getsize(web_png_path) > 0:
+                            log("📸 [Chromium v147] Dowód działania nowoczesnej aplikacji (Proof of Life) został w pełni załadowany i zapisany.")
+                            web_screenshot_taken = True
+                            break
+                        else:
+                            log(f"❌ [Chromium Error] Błąd migawki. Kod wyjścia: {web_code}")
+                            if c_err.strip(): log(f"   [Chromium STDERR]: {c_err.strip()}")
+                    else:
+                        log(f"[INFO] Wykryto port web {port}, ale pominięto zrzut ekranu (brak Chromium na Proxmoxie).")
+                    break
+
         run_cmd(f"ip addr del {host_ip} dev {BRIDGE} 2>/dev/null || true")
         
         status_dr = "SUCCESS"
         log("Audyt sieciowy zakonczony pelnym sukcesem!")
 
-        # 7. Zbieranie Dowodów (Screenshot / Logi wewnętrzne)
+        # 7. Zbieranie Dowodów (Screenshot konsoli maszyn wirtualnych)
         if is_vm:
             log("Pobieranie wirtualnego zrzutu ekranu konsoli (Log Bypass)...")
             screenshot_error_msg = ""
@@ -376,7 +404,7 @@ def main():
                 pdf.ln(10)
                 
                 pdf.set_font("helvetica", "B", 12)
-                pdf.cell(0, 10, "3. Operating System Health Verification:")
+                pdf.cell(0, 10, "3. Operating System Health Verification (Hypervisor Console):")
                 pdf.ln(7)
                 
                 if is_vm:
@@ -388,6 +416,13 @@ def main():
                 else:
                     pdf.set_font("courier", "", 8)
                     pdf.multi_cell(0, 4, clean_text(f"{screenshot_error_msg}\n\n=== LOG SNAPSHOT ===\n{ct_logs}"))
+                
+                if web_screenshot_taken and os.path.exists(web_png_path):
+                    pdf.ln(10)
+                    pdf.set_font("helvetica", "B", 12)
+                    pdf.cell(0, 10, "4. Web Service Application Verification (Proof of Life Screenshot):")
+                    pdf.ln(7)
+                    pdf.image(web_png_path, x=10, w=180)
             
             pdf.output(pdf_path)
             print("[SYSTEM] Plik PDF wygenerowany na dysku.")
@@ -460,7 +495,7 @@ def main():
                 run_cmd(f"pct stop {TEST_VM_ID} 2>/dev/null")
                 run_cmd(f"pct destroy {TEST_VM_ID} 2>/dev/null")
             
-        for f in [png_path, pdf_path]:
+        for f in [png_path, web_png_path, pdf_path]:
             if os.path.exists(f): os.remove(f)
                 
         print(f"=== KONIEC PROCESU AUTOMATYZACJI. WYNIK: {status_dr} ===")
