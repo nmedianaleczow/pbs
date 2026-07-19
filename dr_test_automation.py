@@ -73,7 +73,7 @@ def run_cmd(cmd):
     return result.stdout, result.stderr, result.returncode
 
 def main():
-    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.26) ===")
+    log("=== ROZPOCZECIE AUTOMATYCZNEGO TESTU DR (Wersja 4.27) ===")
     
     status_dr = "CRASHED_BEFORE_START"
     chosen_id = "UNKNOWN"
@@ -221,12 +221,18 @@ def main():
                     try:
                         interfaces = json.loads(agent_out)
                         for iface in interfaces:
-                            if iface.get("name") == "lo": continue
                             for ip_addr in iface.get("ip-addresses", []):
                                 if ip_addr.get("ip-address-type") == "ipv4":
-                                    target_ip = ip_addr.get("ip-address").strip()
+                                    ip_candidate = ip_addr.get("ip-address").strip()
+                                    
+                                    # POPRAWKA: Twarde odrzucenie pętli zwrotnej (Windows Loopback / Linux lo)
+                                    if ip_candidate == "127.0.0.1" or ip_candidate.startswith("127."):
+                                        continue
+                                        
+                                    target_ip = ip_candidate
                                     prefix = ip_addr.get("prefix", 24)
                                     break
+                            if target_ip: break
                         if target_ip: break
                     except: pass
                 time.sleep(5)
@@ -299,12 +305,9 @@ def main():
                         f"(e.g. docker engines, database stacks, backup daemons) did not finish\n" \
                         f"initialization inside the boot window. Consider increasing BOOT_DELAY_VM value in config.json."
         else:
-            # Silnik automatycznej analizy portów webowych z rozszerzoną tablicą monitorowania
             web_ports = re.findall(r"(\d+)/tcp\s+open\s+(\S+)", nmap_out)
             for port, service in web_ports:
                 service_lower = service.lower()
-                
-                # POPRAWKA KLUCZOWA: Rozszerzono listę portów o 8888 (Oxidized), 3000 (Grafana), 5000 (Flask), 9000 (Portainer)
                 if "http" in service_lower or port in ["80", "443", "8080", "8443", "8880", "8888", "3000", "5000", "9000"]:
                     proto = "https" if (port in ["443", "8443"] or "ssl" in service_lower or "https" in service_lower) else "http"
                     web_url = f"{proto}://{target_ip}:{port}"
