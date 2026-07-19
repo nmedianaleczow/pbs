@@ -1,4 +1,4 @@
-# Proxmox VE Automated DR Test Engine (v4.26)
+# Proxmox VE Automated DR Test Engine (v4.27)
 
 Automated Disaster Recovery (DR) testing script for Proxmox VE clusters connected to Proxmox Backup Server (PBS).
 
@@ -38,19 +38,32 @@ Całość wykonuje się w odizolowanym środowisku sieciowym (Sandbox). Skrypt s
 Zaloguj się na hosta PVE przez SSH jako root. Nowoczesne wersje Chromium (150+) posiadają blokady jądra (Crashpad locks), które uniemożliwiają działanie headless na maszynie matce Proxmoxa. **Wymagane jest zainstalowanie stabilnej wersji granicznej Chromium 147 i zablokowanie jej aktualizacji:**
 
 ```bash
-# 1. Instalacja pakietów bazowych
-apt update && apt install nmap tcpdump python3-pil python3-fpdf -y
 ```
-# 2. Downgrade Chromium do stabilnej wersji 147
+# 1. Instalacja standardowych zależności
 ```
-apt install -y \
-  chromium=147.0.7727.137-1~deb13u1 \
-  chromium-common=147.0.7727.137-1~deb13u1 \
-  chromium-sandbox=147.0.7727.137-1~deb13u1
+apt update && apt install -y nmap tcpdump python3-pil python3-fpdf wget
 ```
-# 3. Zablokowanie pakietów przed automatyczną aktualizacją systemu
+# 2. Przygotowanie bezpiecznego katalogu tymczasowego
+```
+mkdir -p /tmp/chromium147 && cd /tmp/chromium147
+```
+# 3. Pobranie paczek bezpośrednio z oficjalnego archiwum historycznego pool Debiana
+```
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb
+wget http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb
+```
+# 4. Instalacja lokalna (APT automatycznie rozwiąże i doinstaluje brakujące zależności systemowe)
+```
+apt install -y ./*.deb
+```
+# 5. Blokada wersji przed automatyczną aktualizacją
 ```
 apt-mark hold chromium chromium-common chromium-sandbox
+```
+# 6. Czyszczenie środowiska po instalacji
+```
+cd / && rm -rf /tmp/chromium147
 ```
 Konfiguracja
 
@@ -122,25 +135,50 @@ How it works
 System Prerequisites
 
 Log in via SSH to your PVE node as root. Modern Chromium builds (150+) introduce kernel-level namespace constraints (Crashpad handlers) that cause immediate crashes on a bare Proxmox host. You must downgrade to the stable threshold version (Chromium 147) and pin the packages:
-Bash
 
-# 1. Install baseline prerequisites
+Bash
+# 1. Update system package index and install baseline dependencies
 ```
-apt update && apt install nmap tcpdump python3-pil python3-fpdf -y
+apt update && apt install -y nmap tcpdump python3-pil python3-fpdf wget
 ```
-# 2. Downgrade Chromium to the stable v147 branch
+# 2. Create an isolated temporary deployment workspace
 ```
-apt install -y \
-  chromium=147.0.7727.137-1~deb13u1 \
-  chromium-common=147.0.7727.137-1~deb13u1 \
-  chromium-sandbox=147.0.7727.137-1~deb13u1
+mkdir -p /tmp/chromium147 && cd /tmp/chromium147
 ```
-# 3. Hold the packages to block automatic system upgrades
+# 3. Fetch exact package binaries from the official Debian snapshot archive pool
+```
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium_147.0.7727.137-1~deb13u1_amd64.deb)
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-common_147.0.7727.137-1~deb13u1_amd64.deb)
+wget [http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb](http://snapshot.debian.org/archive/debian/20260615T000000Z/pool/main/c/chromium/chromium-sandbox_147.0.7727.137-1~deb13u1_amd64.deb)
+```
+# 4. Perform a local installation (APT will natively resolve and pull missing OS shared libraries)
+```
+apt install -y ./*.deb
+```
+# 5. Hold and lock the packages to freeze them against future 'apt upgrade' cycles
 ```
 apt-mark hold chromium chromium-common chromium-sandbox
 ```
+# 6. Purge temporary setup artifacts from the hypervisor storage
+```
+cd / && rm -rf /tmp/chromium147
+```
 
 Changelog / Historia zmian
+v4.27
+
+🇵🇱 Wersja polska:
+
+  Naprawiono błąd wykrywania IP Loopback na Windows: Rozwiązano krytyczny problem, w którym maszyny wirtualne z systemem Windows raportowały interfejs pętli zwrotnej przez QEMU Guest Agent pod nazwą Loopback Pseudo-Interface 1 zamiast lo. Powodowało to błędne przechwytywanie adresu 127.0.0.1 jako adresu IP celu.  
+
+Ochrona przed skanowaniem samego hosta: Zastąpiono zawodne filtrowanie po nazwach interfejsów bezwzględnym filtrem na poziomie adresów IP (ip.startswith("127.")). Całkowicie eliminuje to ryzyko, że skrypt weźmie pod ostrzał Nmapa usługi lokalne samego hypervisora Proxmox podczas testowania systemów Windows.
+
+🇬🇧 English Version:
+
+Fixed Windows Loopback IP Resolution Bug: Resolved a critical issue where Windows VMs reporting a loopback adapter via the QEMU Guest Agent (named Loopback Pseudo-Interface 1 instead of Linux's standard lo) would trick the script into capturing 127.0.0.1 as the target production IP.  
+
+Hypervisor Self-Scanning Protection: Migrated away from unreliable interface name-based filtering to a strict IP-level validation handler (ip.startswith("127.")). This completely prevents the script from accidentally targeting and auditing the Proxmox host's own local services (like the PVE API daemon) when testing Windows environments.
+
 v4.26
 
 🇵🇱 Wersja polska:
